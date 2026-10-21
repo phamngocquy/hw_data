@@ -1,0 +1,113 @@
+name: openweather-etl
+
+x-database-url: &database-url postgres://etl:etl@postgres:5432/etl?sslmode=disable
+# Write the ./data and ./logs bind mounts as the host user (set by `make run`).
+x-host-user: &host-user "${HOST_UID:-1000}:${HOST_GID:-1000}"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: etl
+      POSTGRES_PASSWORD: etl
+      POSTGRES_DB: etl
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl -d etl"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  ingestor:
+    build: ./ingestor
+    user: *host-user
+    env_file: ./ingestor/.env
+    environment:
+      DATABASE_URL: *database-url
+      FETCH_INTERVAL: 30s
+      LOG_LEVEL: info
+      LOG_FILE: /app/logs/etl.log
+      OPENWEATHER_LOCATION: singapore
+      OPENWEATHER_LAT: "1.2897"
+      OPENWEATHER_LON: "103.8501"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Same image as pipeline, so server and client use the versions pinned in orchestrator/uv.lock.
+  prefect-server:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_HOME: /var/lib/prefect
+      # Relative, so the UI calls the API on whatever host port it is opened on.
+      PREFECT_UI_API_URL: /api
+    ports: ["${PREFECT_PORT:-4300}:4200"]
+    volumes:
+      - prefect:/var/lib/prefect
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    user: *host-user
+    env_file:
+      - ./extractor/.env
+      - ./transformer/.env
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      PUSHGATEWAY_URL: http://pushgateway:9091
+      DATABASE_URL: *database-url
+      LOG_LEVEL: info
+      LOG_FILE: /app/logs/etl.log
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+      pushgateway:
+        condition: service_started
+    restart: on-failure
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus:/prometheus
+    depends_on: [ingestor, pushgateway]
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/etl-dashboard.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana:/var/lib/grafana
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:
+  prefect:
+  prometheus:
+  grafana:

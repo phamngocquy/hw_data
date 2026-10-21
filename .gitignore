@@ -1,0 +1,3 @@
+# Runtime output of the stack (bind-mounted into the containers).
+data/
+logs/
