@@ -78,7 +78,7 @@ flowchart TB
 | Ingestion | **ingestor** | Go | long-running container |
 | Storage | **Postgres** (raw store) and the **data lake** (`data/`) | Postgres 16, local files | container, bind mount |
 | Processing | **extractor** → **transformer**, run by the **orchestrator** | Go, Python, Prefect 3 | hourly Prefect flow |
-| Observability | logs, **Prometheus** + **Pushgateway**, **Grafana** | slog, prometheus clients | containers |
+| Observability | logs, **Prometheus** + **Pushgateway**, **Grafana** | Go `log/slog` and Python `logging` (key=value logs), Prometheus client libraries | containers |
 
 Each module is its own project with its own dependencies. `ingestor/` and `extractor/` are
 separate Go modules (`go.mod`); `transformer/` and `orchestrator/` are separate uv projects
@@ -207,13 +207,14 @@ folders as your user. Always start with `make run`, not a bare `docker compose u
 | http://localhost:3000 | **Grafana**, dashboard *OpenWeather ETL* |
 | http://localhost:4300 | **Prefect**: schedule, run history, logs, manual runs |
 
-Only these two ports are published; set `GRAFANA_PORT` / `PREFECT_PORT` if they are taken.
+Only these two ports are published; if one is taken, change it at start, e.g.
+`PREFECT_PORT=4400 make run`.
 Postgres, Prometheus, the Pushgateway and the ingestor stay on the internal network.
 
 ### Run a batch now
 
-The flow runs every hour at minute 0 (UTC) and processes the previous hour. To run it now, or
-for any hour:
+The flow runs every hour at minute 0 (UTC) and processes the previous hour. A run started by hand
+without `start` (Quick Run) processes the current hour so far. To run it now, or for any hour:
 
 ```bash
 docker compose exec pipeline prefect deployment run 'open-weather-etl/open_weather'
@@ -353,7 +354,7 @@ extract(start)  ── stdout: path of the raw file it wrote ──►  transfor
 
   | Field | Format | Meaning |
   |---|---|---|
-  | `start` | `YYYYMMDD HH`, e.g. `20261020 15` | The run processes `[start, start + 1h)`. Empty means the hour before the scheduled time. |
+  | `start` | `YYYYMMDD HH`, e.g. `20261020 15` | The run processes `[start, start + 1h)`. Empty means the hour that ends at or after the run time: a scheduled 18:00 run and a manual run at 17:10 both take `[17:00, 18:00)`. |
 
 - **Run name:** `<flow>_<start>-<end>`, e.g. `open-weather-etl_20261021_16-20261021_17`.
 - **extract** runs the Go binary as `extractor --from "<start>" --run-id <flow run id>`. Its
@@ -392,8 +393,8 @@ lines also have `run_id`.
 ```
 time=2026-10-21T15:13:23.157Z level=INFO msg="api request succeeded" component=ingestor source=open_weather duration_ms=67
 time=2026-10-21T15:13:39.406Z level=ERROR msg="api request failed" component=ingestor source=open_weather duration_ms=230 error="openweather status 401: …"
-time=2026-10-21T16:16:09.326Z level=INFO msg="data saved" component=extractor run_id=d36dd535-… source=open_weather file=".../20261021_1620.v2.json" version=2 rows=33
-time=2026-10-21T16:16:09.338Z level=INFO msg="data saved" component=transformer run_id=d36dd535-… source=open_weather file=".../20261021_1620.v2.csv" version=2 written=33 error=0
+time=2026-10-21T17:15:27.669Z level=INFO msg="data saved" component=extractor run_id=a2b18b53-… source=open_weather file=".../20261021_1800.v3.json" version=3 rows=18
+time=2026-10-21T17:15:27.691Z level=INFO msg="data saved" component=transformer run_id=a2b18b53-… source=open_weather file=".../20261021_1800.v3.csv" version=3 written=18 error=0
 time=2026-10-21T15:13:40.579Z level=ERROR msg="transformation error" component=transformer run_id=test-run source=open_weather id=3 error=KeyError('main')
 ```
 
@@ -404,7 +405,9 @@ Each module configures its own logging from `LOG_FILE` and `LOG_LEVEL` (`debug`,
 
 `GET /health` on the ingestor returns `200 ok` when Postgres answers a ping, and `503` otherwise.
 It is meant for container and load-balancer health checks. Freshness is a metric rather than
-part of health: an upstream outage should raise an alert, not restart a healthy process.
+part of health: an upstream outage should raise an alert, not restart a healthy process. The
+port is internal; check it from the Docker network with
+`docker compose exec prometheus wget -qO- ingestor:8080/health`.
 
 ### Metrics
 
@@ -459,7 +462,6 @@ The provisioned dashboard **OpenWeather ETL** has one row per module:
 A **Source** dropdown at the top filters every panel, so each pipeline can be viewed on its own
 or all together.
 
-
 ### Prefect
 
 Prefect is the second monitoring surface, focused on runs rather than metrics.
@@ -475,7 +477,7 @@ Prefect is the second monitoring surface, focused on runs rather than metrics.
   | a `open-weather-etl` run enters `Failed` or `Crashed` | send a notification (Slack / Teams block) or call a webhook |
   | no `open-weather-etl` run completes for 65 minutes (proactive trigger) | notify: an hourly run was missed |
   | a run stays `Running` for more than 15 minutes | notify, or cancel the run |
-  | a run enters `Failed` | run the deployment again with the same `window` |
+  | a run enters `Failed` | retry that flow run (*change flow run state* to Scheduled), so it re-processes the same window |
 
 - **Webhooks.** Outgoing webhooks (the *call webhook* action or a custom webhook notification
   block) work on the self-hosted server, so alerts can reach any HTTP endpoint: Slack, PagerDuty,
@@ -563,9 +565,6 @@ metrics. Metrics, logs, file layout and the dashboard are already keyed by `sour
 
 These are intentional for a take-home and are the first things to harden:
 
-- **No retries.** A failed API call waits for the next tick; a failed batch is re-run from Prefect.
-- **No dedup.** Every poll is kept, so an observation can appear several times; `record_id` identifies it.
-- **No cleanup.** Postgres rows and file versions are never pruned, and the log file is not rotated.
 - **Late rows.** A row fetched in an hour that was already extracted only appears after that hour is re-run.
 - **Single instance.** One ingestor, one Prefect server on SQLite, one serving process.
 - **One location**, and the API key lives in `ingestor/.env` (git-ignored).

@@ -21,7 +21,7 @@ class ExtractWindow(BaseModel):
         description=(
             'Start hour, "YYYYMMDD HH". The run processes [start, start + 1h); '
             "output files are named after start + 1h (…/20261020_1600.json). "
-            "Leave empty for the hour before the scheduled time."
+            "Leave empty for the hour that ends at or after the run time."
         ),
         examples=["20261020 15"],
     )
@@ -34,10 +34,11 @@ def window_hours(start: str | None) -> tuple[datetime, datetime]:
     if start:
         begin = datetime.strptime(start, HOUR_FORMAT)
     else:
-        scheduled = flow_run.scheduled_start_time.astimezone(UTC)
-        begin = scheduled.replace(
-            minute=0, second=0, microsecond=0
-        ) - timedelta(hours=1)
+        # The hour that ends at or after the run time: a scheduled 18:00 run
+        # and a manual run at 17:10 both take [17:00, 18:00).
+        run_at = flow_run.scheduled_start_time.astimezone(UTC)
+        last_instant = run_at - timedelta(microseconds=1)
+        begin = last_instant.replace(minute=0, second=0, microsecond=0)
     return begin, begin + timedelta(hours=1)
 
 
