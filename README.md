@@ -23,81 +23,136 @@ Prometheus metrics and a Grafana dashboard make every step observable.
 
 ## 1. High-level design
 
+### 1.1 Goal
+
+Collect weather data from an open REST API, keep every response, and turn it into a clean,
+structured dataset in a local data lake. The requirements are:
+
+- fetch the API every 30 seconds and store the data in Postgres;
+- export the data from Postgres to local JSON files;
+- transform it: remove unnecessary fields, normalize the structure, use UTC timestamps;
+- keep raw and processed data apart, and append instead of overwriting;
+- log and expose health and metrics; run everything in Docker.
+
+### 1.2 Architecture
+
+The system has four layers, from the source down to the data lake, plus observability across
+all of them:
+
 ```mermaid
-flowchart LR
-    OW[OpenWeather API] -- every 30 s --> ING
+flowchart TB
+    SRC[OpenWeather API]
 
-    subgraph SERVICE[Long-running service]
-        ING[ingestor<br/>Go]
+    subgraph INGEST[Ingestion layer: continuous]
+        ING[ingestor<br/>Go service]
     end
-    ING -- INSERT raw JSON --> PG[(Postgres<br/>open_weather_raw)]
 
-    subgraph BATCH[Prefect flow, hourly at :00 UTC]
-        EXT[extractor<br/>Go CLI] -- raw file path --> TRF[transformer<br/>Python]
+    subgraph STORE[Storage layer]
+        PG[(Postgres<br/>open_weather_raw)]
     end
-    PG -- rows with run_at in the hour --> EXT
-    EXT --> RAW[/data/open_weather/raw/…/YYYYMMDD_HHMM.json/]
+
+    subgraph PROCESS[Processing layer: Prefect flow, every hour]
+        EXT[extractor<br/>Go] --> TRF[transformer<br/>Python]
+    end
+
+    subgraph LAKE[Data lake]
+        RAW[/raw: JSON Lines/]
+        V1[/v1: CSV/]
+    end
+
+    OBS[[Observability<br/>logs/etl.log · Prometheus · Grafana]]
+
+    SRC -- every 30 s --> ING
+    ING -- full response --> PG
+    PG -- rows of one hour --> EXT
+    EXT --> RAW
     RAW --> TRF
-    TRF --> V1[/data/open_weather/v1/…/YYYYMMDD_HHMM.csv/]
-
-    ING -- scrape /metrics --> PROM[Prometheus]
-    EXT -- push --> PGW[Pushgateway]
-    TRF -- push --> PGW
-    PGW --> PROM --> GRAF[Grafana]
+    TRF --> V1
+    ING -.-> OBS
+    EXT -.-> OBS
+    TRF -.-> OBS
 ```
 
-### Components
-
-| Module | Tech | Runs as | Responsibility |
+| Layer | Component | Tech | Runs as |
 |---|---|---|---|
-| **ingestor** | Go | long-running container | Calls the API every 30 s and saves each full response in Postgres. Serves `/health` and Prometheus `/metrics`. |
-| **extractor** | Go | CLI, started by Prefect | Exports the rows of one hour from Postgres to a raw JSON Lines file in the data lake. |
-| **transformer** | Python | library + CLI, started by Prefect | Turns that raw file into a flat, normalized CSV. |
-| **orchestrator** | Python, Prefect 3 | long-running `flow.serve()` | Runs extract → transform every hour. Hours can be re-run or backfilled from the UI. |
-| **monitoring** | Prometheus, Pushgateway, Grafana | containers | Collects metrics from all three modules and shows them on a provisioned dashboard. |
+| Ingestion | **ingestor** | Go | long-running container |
+| Storage | **Postgres** (raw store) and the **data lake** (`data/`) | Postgres 16, local files | container, bind mount |
+| Processing | **extractor** → **transformer**, run by the **orchestrator** | Go, Python, Prefect 3 | hourly Prefect flow |
+| Observability | logs, **Prometheus** + **Pushgateway**, **Grafana** | slog, prometheus clients | containers |
 
 Each module is its own project with its own dependencies. `ingestor/` and `extractor/` are
 separate Go modules (`go.mod`); `transformer/` and `orchestrator/` are separate uv projects
-(`pyproject.toml` + `uv.lock`). The orchestrator depends on the transformer package.
+(`pyproject.toml` + `uv.lock`).
 
-### How data moves
+### 1.3 Layers
 
-1. **Ingest (every 30 s).** The ingestor fetches the current weather and inserts the whole
-   response into `open_weather_raw.data` (JSONB), with `run_at` = the time of the fetch.
-2. **Extract (hourly).** For a window `[start, start + 1h)`, the extractor reads the rows whose
-   `run_at` is in the window and writes them as JSON Lines to
-   `data/open_weather/raw/year=YYYY/month=MM/day=DD/YYYYMMDD_HHMM.json`. The file is named after
-   the window end.
-3. **Transform (right after).** The transformer reads exactly that file, maps every row to the
-   v1 schema (UTC timestamps, °C, cleaned text, transport fields removed), and writes
-   `data/open_weather/v1/year=YYYY/month=MM/day=DD/YYYYMMDD_HHMM.csv`.
-4. **Observe.** Each step logs to `logs/etl.log` and publishes metrics. The batch steps also
-   publish their run's parameters and metadata.
+**Ingestion layer: `ingestor`.** A long-running Go service. Every 30 s it calls the API and
+inserts the whole response into Postgres, with `run_at` set to the time of the fetch. It serves
+`/health` and Prometheus `/metrics`. Polling every 30 s is a continuous workload, so a process
+with a ticker is simpler and cheaper than a job started 120 times an hour.
 
-### Design decisions
+**Storage layer: Postgres and the data lake.**
 
-- **A service for ingestion, a batch for the rest.** Polling every 30 s is a continuous
-  workload, and a long-lived process with a ticker is simpler and cheaper than starting a job
-  120 times an hour. Export and transformation have no latency requirement, so they run as an
-  hourly batch that is easy to re-run and backfill.
-- **Postgres keeps the untransformed response.** The ingestor stores the whole response as JSONB,
-  without picking or renaming fields. Postgres is the record of "what the API returned and
-  when". A change in the API payload never breaks ingestion, and shaping happens downstream.
-- **Two lake layers.** `raw/` holds the rows as stored; `v1/` holds the processed data, named
-  after its schema version, so a future `v2/` can live next to it during a migration. Paths use
-  Hive-style partitions (`year=/month=/day=`) that Spark, Athena and DuckDB understand.
+- *Postgres* is the record of "what the API returned and when". The response is stored as JSONB,
+  without picking or renaming fields, so a change in the payload never breaks ingestion.
+- *The data lake* (`data/<source>/`) has two layers:
+  - `raw/` holds the rows exported from Postgres;
+  - `v1/` holds the processed data, named after its schema version, so a future `v2/` can live
+    next to it.
+
+  Both use Hive-style partitions (`year=/month=/day=`) and one file per hourly window, named
+  after the window end.
+
+**Processing layer: `extractor` → `transformer`, run by Prefect.** Export and transformation
+have no latency requirement, so they run as an hourly batch that is easy to re-run and backfill.
+
+- Each run has a window `[start, start + 1h)`.
+- The **extractor** (Go) writes the rows whose `run_at` is in the window to a raw JSON Lines
+  file, and prints the file path.
+- The **transformer** (Python) reads exactly that file, maps every row to the v1 schema (UTC
+  timestamps, °C, cleaned text, transport fields removed), and writes a CSV.
+- The **orchestrator** (Prefect) runs both steps every hour at :00 UTC, for the previous hour.
+  Any window can also be started from the UI.
+
+**Observability.**
+
+- Every module appends key=value lines to `logs/etl.log`.
+- The ingestor is scraped by Prometheus. The batch steps exit after each run, so they push their
+  metrics to a Pushgateway, including a `*_run_info` metric with the run's parameters.
+- Grafana shows everything on one dashboard, filterable by source.
+- Prefect tracks every run (state, parameters, logs). Automations, webhooks and an MCP server
+  for LLM assistants can be built on top of it.
+
+### 1.4 One run, end to end
+
+The scheduled run at **17:00 UTC** on 2026-10-21:
+
+1. Since 16:00, the ingestor has inserted a row every 30 s, about 120 rows.
+2. Prefect starts the flow run `open-weather-etl_20261021_16-20261021_17` with the window
+   `[16:00, 17:00)`.
+3. The extractor writes those rows to
+   `data/open_weather/raw/year=2026/month=10/day=21/20261021_1700.v1.json` and points
+   `20261021_1700.json` at it.
+4. The transformer turns that file into
+   `data/open_weather/v1/year=2026/month=10/day=21/20261021_1700.v1.csv` and points
+   `20261021_1700.csv` at it.
+5. Both steps log with the same `run_id` and push their metrics. Grafana shows the run with its
+   window, files and row counts.
+
+### 1.5 Design decisions
+
 - **Append-only, versioned files.** Every run, including a re-run of the same hour, writes a new
   immutable version (`….vN.json` / `….vN.csv`) and repoints a "frontier" symlink
-  (`….json` / `….csv`) to it. Nothing is overwritten. Consumers read the frontier; old versions
-  stay for audit and rollback.
+  (`….json` / `….csv`) to it. Nothing is overwritten; consumers read the frontier, and old
+  versions stay for audit and rollback.
 - **Idempotent windows.** A run is fully defined by its window. The same window always reads the
   same rows and produces the same content, so re-running is safe.
-- **One source name, everywhere.** Each module keeps source-specific code in its own sub-package
-  (`…/openweather`, `…/open_weather`) with the source name as a constant. The same value is the
-  data-lake folder, the `source` label on every metric and the `source` field on every log line.
-- **Generic observability.** Metrics are shared by all sources and labelled by `source`, so a new
-  source gets metrics, dashboards and alerts for free. Batch jobs exit after each run, so they push
-  their metrics to a Pushgateway, including a `*_run_info` metric with the run's parameters.
+- **One source name, everywhere.** Each module keeps source-specific code in its own sub-package,
+  with the source name as a constant. The same value is the data-lake folder, the `source`
+  label on every metric and the `source` field on every log line, so a new source is added
+  without touching the shared parts.
+- **Generic observability.** Metrics are shared by all sources and labelled by `source`, so a
+  new source gets its metrics, dashboard panels and alerts for free.
 
 ---
 
@@ -404,24 +459,66 @@ The provisioned dashboard **OpenWeather ETL** has one row per module:
 A **Source** dropdown at the top filters every panel, so each pipeline can be viewed on its own
 or all together.
 
+
+### Prefect
+
+Prefect is the second monitoring surface, focused on runs rather than metrics.
+
+- **Prefect UI** (http://localhost:4300): run history and states (`Completed`, `Failed`,
+  `Late`, `Crashed`), each run's window in its name and parameters, and its logs. The
+  extractor's log lines are forwarded there, so a failure shows its real cause.
+- **Automations** react to run events and work on the self-hosted server. They are created in
+  **Automations → New automation** in the UI. Useful ones for this pipeline:
+
+  | Trigger | Action |
+  |---|---|
+  | a `open-weather-etl` run enters `Failed` or `Crashed` | send a notification (Slack / Teams block) or call a webhook |
+  | no `open-weather-etl` run completes for 65 minutes (proactive trigger) | notify: an hourly run was missed |
+  | a run stays `Running` for more than 15 minutes | notify, or cancel the run |
+  | a run enters `Failed` | run the deployment again with the same `window` |
+
+- **Webhooks.** Outgoing webhooks (the *call webhook* action or a custom webhook notification
+  block) work on the self-hosted server, so alerts can reach any HTTP endpoint: Slack, PagerDuty,
+  an incident tool. Incoming webhooks, which turn an external event into a run (e.g. "upstream
+  data landed, run the window now"), are a Prefect Cloud feature.
+- **LLM assistants through MCP.** Prefect's official
+  [MCP server](https://docs.prefect.io/v3/how-to-guides/ai/use-prefect-mcp-server) (beta,
+  read-only) gives an MCP client, such as Claude or Cursor, access to deployments, flow runs,
+  task runs, logs, events and automations. The assistant can then answer questions like "which
+  `open-weather-etl` runs failed today, and why?" or "show the logs of the 16:00 window".
+  Point it at this stack's API:
+
+  ```json
+  {
+    "mcpServers": {
+      "prefect": {
+        "command": "uvx",
+        "args": ["--from", "prefect-mcp", "prefect-mcp-server"],
+        "env": { "PREFECT_API_URL": "http://localhost:4300/api" }
+      }
+    }
+  }
+  ```
+
+  The MCP tools only read. Re-runs still go through the Prefect UI or CLI
+  (`prefect deployment run …`).
+
+These are not configured in the repo; they are set up on the running Prefect server.
+
 ---
 
 ## 7. Configuration
 
-| Variable | Module | Default | Meaning |
+Each module reads its settings from its own `.env` file (copy it from `.env.example`):
+
+| File | Variable | Example | Meaning |
 |---|---|---|---|
-| `OPENWEATHER_API_KEY` | ingestor (`ingestor/.env`) | — | API key |
-| `OPENWEATHER_LOCATION`, `OPENWEATHER_LAT`, `OPENWEATHER_LON` | ingestor | `singapore`, `1.2897`, `103.8501` | location to poll |
-| `FETCH_INTERVAL` | ingestor | `30s` | polling interval |
-| `HTTP_ADDR` | ingestor | `:8080` | `/health` and `/metrics` address |
-| `RAW_FILE_TEMPLATE` | extractor (`extractor/.env`) | — | raw file path template |
-| `PROCESSED_FILE_TEMPLATE` | transformer (`transformer/.env`) | — | processed file path template |
-| `DATABASE_URL` | ingestor, extractor | `postgres://etl:etl@localhost:5432/etl?sslmode=disable` | Postgres connection |
-| `PUSHGATEWAY_URL` | extractor, transformer | empty (no push) | where batch metrics go |
-| `LOG_FILE`, `LOG_LEVEL` | each module | `logs/etl.log`, `info` | log file and level |
-| `PREFECT_API_URL` | pipeline | `http://prefect-server:4200/api` | Prefect server |
-| `HOST_UID`, `HOST_GID` | compose (set by `make run`) | `1000` | user that writes `data/` and `logs/` |
-| `GRAFANA_PORT`, `PREFECT_PORT` | compose | `3000`, `4300` | published UI ports |
+| `ingestor/.env` | `OPENWEATHER_API_KEY` | — | OpenWeather API key |
+| `extractor/.env` | `RAW_FILE_TEMPLATE` | `data/{source_name}/raw/year=YYYY/month=MM/day=DD/YYYYMMDD_HHMM.json` | where each run's raw file is written |
+| `transformer/.env` | `PROCESSED_FILE_TEMPLATE` | `data/{source_name}/{schema_version}/year=YYYY/month=MM/day=DD/YYYYMMDD_HHMM.csv` | where each run's processed file is written |
+
+Template tokens: `{source_name}`, `{schema_version}`, `YYYY`, `MM`, `DD`, `YYYYMMDD`, `HHMM`.
+They are filled with the source and the window end (UTC).
 
 ---
 
